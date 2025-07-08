@@ -55,6 +55,16 @@ cnpg-controller-manager-6848689f4-l2ztv   1/1     Running   0             4m
 
 Usamos el manifiesto YAML para la creacion del cluster
 ```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgresql-secrets
+type: kubernetes.io/basic-auth
+data:
+  username: bmV4dGNsb3Vk
+  password: cm9vdHBhc3N3b3Jk
+
+---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -252,3 +262,8 @@ redis-cluster-master                ClusterIP   10.108.248.73   <none>        63
 ```
 > [!NOTE]
 > Para mayor informacion del servicio, leer la documentacion [aqui](https://ot-redis-operator.netlify.app/docs/overview/).
+
+## Nextcloud
+Es la aplicacion principal la cual es un software de código abierto para crear y utilizar servicios de alojamiento de archivos y colaboración en la nube
+
+### Componentes PHP - Apache
