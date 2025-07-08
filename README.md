@@ -250,3 +250,5 @@ redis-cluster-leader-additional     ClusterIP   10.110.44.13    <none>        63
 redis-cluster-leader-headless       ClusterIP   None            <none>        6379/TCP   4m18s
 redis-cluster-master                ClusterIP   10.108.248.73   <none>        6379/TCP   4m17s
 ```
+> [!NOTE]
+> Para mayor informacion del servicio, leer la documentacion [aqui](https://ot-redis-operator.netlify.app/docs/overview/).
