@@ -114,7 +114,7 @@ kubectl apply -f cluster-postgresql.yaml
 ```
 
 Crearemos las copias de seguridad periódicas
-```
+```yaml
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup
 metadata:
@@ -161,9 +161,9 @@ El operador de Redis admite las siguientes estrategias de implementación para R
 - **Replicación:** Utiliza replicación asíncrona, lo que significa que el nodo líder no espera a que los nodos seguidores apliquen los cambios antes de enviar nuevas actualizaciones. En su lugar, los nodos seguidores se ponen al día con el nodo líder tan pronto como pueden.
 - **Sentinel:** Es una herramienta que proporciona conmutación por error y monitorización automáticas para los nodos de Redis.
 
-Para el caso actual, usaremos el metodo de cluster,El siguiente diagrama proporciona una vista simplista de la arquitectura compartida
+Para el caso actual, usaremos el metodo de Replicacion,El siguiente diagrama proporciona una vista simplista de la arquitectura compartida
 
-![guia](pictures/cluster-redis.png)
+![guia](pictures/replication-redis.png)
 
 ### Instalacion del Cluster Redis
 Añadimos el repositorio en helm y lo instalamos
@@ -182,52 +182,60 @@ redis-operator-bb784b6df-4pfxt   1/1     Running   0             4m
 Usamos el manifiesto YAML para la creacion del cluster
 ```yaml
 apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisCluster
+kind: RedisSentinel
 metadata:
-  name: redis-cluster
+  name: redis-sentinel
 spec:
   clusterSize: 3
-  clusterVersion: v7
   podSecurityContext:
-    runAsUser: 0 
-    fsGroup: 0 #1000
-  persistenceEnabled: true
+    runAsUser: 1000
+    fsGroup: 1000
+  redisSentinelConfig:
+    redisReplicationName: redis-replication
+    redisReplicationPassword:
+      secretKeyRef:
+        name: password-nextcloud
+        key: redis_password
   kubernetesConfig:
-    image: quay.io/opstree/redis:v7.0.12
+    image: quay.io/opstree/redis-sentinel:v7.0.15
     imagePullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: 101m
-        memory: 1Gi
-      limits:
-        cpu: 1000m
-        memory: 6Gi
     redisSecret:
       name: password-nextcloud
-      key: redis_password 
-
-  redisLeader:
-    replicas: 3
-    securityContext:
-      allowPrivilegeEscalation: true
-      runAsGroup: 0 #1000
-      runAsUser: 0 
-      
-  redisFollower:
-    replicas: 3
-    securityContext:
-      allowPrivilegeEscalation: true
-      runAsGroup: 0 #1000
-      runAsUser: 0
-
+      key: redis_password
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: redis-replication
+spec:
+  clusterSize: 3
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    redisSecret:
+      name: password-nextcloud
+      key: redis_password
   storage:
     volumeClaimTemplate:
       spec:
-        storageClassName: standard
+        storageClassName: nfs-client
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
             storage: 10Gi
+  redisExporter:
+    enabled: false
+    image: quay.io/opstree/redis-exporter:v1.44.0
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
 ```
 ```
 kubectl apply -f cluster-redis.yaml
@@ -238,27 +246,28 @@ Verificamos el funcionamiento del cluster
 kubectl get pods
 ```
 ```
-NAME                       READY   STATUS    RESTARTS   AGE
-redis-cluster-follower-0   1/1     Running   0          99s
-redis-cluster-follower-1   1/1     Running   0          67s
-redis-cluster-follower-2   1/1     Running   0          46s
-redis-cluster-leader-0     1/1     Running   0          3m21s
-redis-cluster-leader-1     1/1     Running   0          2m54s
-redis-cluster-leader-2     1/1     Running   0          2m10s
+NAME                        READY   STATUS    RESTARTS   AGE
+redis-replication-0         1/1     Running   0             15m
+redis-replication-1         1/1     Running   0             15m
+redis-replication-2         1/1     Running   0             15m
+redis-sentinel-sentinel-0   1/1     Running   0             14m
+redis-sentinel-sentinel-1   1/1     Running   0             14m
+redis-sentinel-sentinel-2   1/1     Running   0             14m
 ```
 ```
 kubectl get services
 ```
 ```
-NAME                                TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
-kubernetes                          ClusterIP   10.96.0.1       <none>        443/TCP    90d
-redis-cluster-follower              ClusterIP   10.96.32.211    <none>        6379/TCP   2m36s
-redis-cluster-follower-additional   ClusterIP   10.101.183.30   <none>        6379/TCP   2m36s
-redis-cluster-follower-headless     ClusterIP   None            <none>        6379/TCP   2m36s
-redis-cluster-leader                ClusterIP   10.97.190.34    <none>        6379/TCP   4m18s
-redis-cluster-leader-additional     ClusterIP   10.110.44.13    <none>        6379/TCP   4m18s
-redis-cluster-leader-headless       ClusterIP   None            <none>        6379/TCP   4m18s
-redis-cluster-master                ClusterIP   10.108.248.73   <none>        6379/TCP   4m17s
+NAME                                 TYPE           CLUSTER-IP       EXTERNAL-IP    PORT(S)        AGE
+kubernetes                           ClusterIP      10.96.0.1        <none>         443/TCP        30m
+redis-replication                    ClusterIP      10.111.8.17      <none>         6379/TCP       16m
+redis-replication-additional         ClusterIP      10.104.207.9     <none>         6379/TCP       16m
+redis-replication-headless           ClusterIP      None             <none>         6379/TCP       16m
+redis-replication-master             ClusterIP      10.98.144.110    <none>         6379/TCP       16m
+redis-replication-replica            ClusterIP      10.99.112.250    <none>         6379/TCP       16m
+redis-sentinel-sentinel              ClusterIP      10.111.52.25     <none>         26379/TCP      16m
+redis-sentinel-sentinel-additional   ClusterIP      10.97.14.223     <none>         26379/TCP      16m
+redis-sentinel-sentinel-headless     ClusterIP      None             <none>         26379/TCP      16m
 ```
 > [!NOTE]
 > Para mayor informacion del servicio, leer la documentacion [aqui](https://ot-redis-operator.netlify.app/docs/overview/).
