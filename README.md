@@ -1,616 +1,236 @@
-# Nextcloud-con-cluster-en-kubernetes
-Instalacion de Nextcloud en kubernetes usando clusters de postgresql y redis para alta disponibilidad
+# Instalacion de RK2 con Cilium
 
-## Postgresql
-Postgresql es la base de datos que usaremos para almacenar la informacion de Nextcloud ademas de los metadatos que se generen. para la generacion del cluster:
+Para instalar **RKE2** con **Cilium** y un Ingress controller, el proceso se divide en dos fases principales: prepararacion del nodo e instalacion de componentes.
 
-### CloudNativePG
-Es un operador de código abierto para Kubernetes que admite la creacion clústeres PostgreSQL basados ​​en replicación de transmisión asincrónica y sincrónica para administrar múltiples réplicas en espera activa dentro del mismo clúster de Kubernetes, con las siguientes especificaciones:
+## Nodo Mestro
 
-- Un servidor principal, con múltiples réplicas opcionales en espera activa para alta disponibilidad 
-- Servicios disponibles para aplicaciones:
-  *  **rw:** las aplicaciones se conectan solo a la instancia principal del clúster
-  *  **ro:** las aplicaciones se conectan solo a réplicas en espera activa para cargas de trabajo de solo lectura (opcional)
-  *  **r:** las aplicaciones se conectan a cualquiera de las instancias para cargas de trabajo de solo lectura (opcional)
+### Fase 1: Preparación del Nodo
 
-El siguiente diagrama proporciona una vista simplista de la arquitectura compartida recomendada para un clúster PostgreSQL
+1.  **Crea el archivo de configuración de RKE2**: Antes de instalar RKE2, necesitas decirle que no use sus componentes predeterminados. Para ello, crea un directorio y un archivo de configuración.
 
-![guia](/pictures/k8s-pg-architecture.png)
+    ```sh
+    sudo mkdir -p /etc/rancher/rke2/
+    sudo tee /etc/rancher/rke2/config.yaml > /dev/null <<EOF
+    cni: "none"
+    disable:
+    - rke2-ingress-nginx
+    disable-kube-proxy: true
+    EOF
+    ```
 
-#### Cargas de trabajo de lectura y escritura
-Nextcloud usara la instancia maestra de PostgreSQL para las acciones de escritura/lectura de la base de datos, como se muestra en el siguiente diagrama:
+      * `cni: "none"`: Le dice a RKE2 que no instale ningún CNI por defecto.
+      * `disable: - rke2-ingress-nginx`: Desactiva el controlador NGINX Ingress que viene incluido con RKE2.
+      * `disable-kube-proxy: true`: Deshabilita el `kube-proxy` de Kubernetes, ya que Cilium se encargará de esta función.
 
-![guia](pictures/architecture-rw.png)
+2.  **Instala RKE2**: Descarga y ejecuta el script de instalación.
 
-> [!NOTE]
->Las aplicaciones usaran el servicio de sufijo **-rw**.
+    ```sh
+    curl -sfL https://get.rke2.io | sudo sh -
+    ```
 
-> [!TIP]
-> En caso de indisponibilidad temporal o permanente del servidor principal, para fines de alta disponibilidad CloudNativePG activará una conmutación por error, apuntando el -rw servicio a otra instancia del clúster.
+    Una vez que el script finalice, se instalarán los servicios necesarios.
 
-#### Cargas de trabajo de solo lectura
-Nextcloud usara las instancias replicas de PostgreSQL para las acciones de lectura de la base de datos, como se muestra en el siguiente diagrama:
+3.  **Inicia el servicio de RKE2**: Inicia el servicio y habilítalo para que se inicie automáticamente en cada reinicio.
 
-![guia](pictures/architecture-read-only.png)
+    ```sh
+    sudo systemctl enable --now rke2-server.service
+    ```
 
-> [!NOTE]
-> Las aplicaciones usaran el servicio de sufijo **-ro**.
+    En este punto, el clúster estará en funcionamiento, pero los nodos estarán en estado `NotReady` porque aún no tienen un CNI.
 
-### Instalacion del cluster PostgreSQL
-Para la instalacion usaremos el manifiesto YAML, de la documentacion
+-----
 
-```
-kubectl apply --server-side -f \
-https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.26/releases/cnpg-1.26.0.yaml
-```
+### Fase 2: Instalación de Cilium e Ingress
 
-Comprobamos la instalacion
-```
-kubectl get pods -n cnpg-system
-```
-```
-NAME                                      READY   STATUS    RESTARTS      AGE
-cnpg-controller-manager-6848689f4-l2ztv   1/1     Running   0             4m
-```
+1.  **Copia el `kubeconfig`**: Para poder interactuar con el clúster, necesitas acceder al archivo de configuración.
 
-Usamos el manifiesto YAML para la creacion del cluster
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: postgresql-secrets
-type: kubernetes.io/basic-auth
-data:
-  username: bmV4dGNsb3Vk
-  password: cm9vdHBhc3N3b3Jk
+    ```sh
+    mkdir -p ~/.kube
+    sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/config
+    sudo chown $(id -u):$(id -g) ~/.kube/config
+    ```
 
----
-apiVersion: postgresql.cnpg.io/v1
-kind: Cluster
-metadata:
-  name: postgresql-node
-spec:
-  instances: 3
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.5
-  primaryUpdateStrategy: unsupervised
+2.  **Instala Cilium con Helm**: Cilium es la mejor opción para la gestión de la red. Utilizar la guia oficial te permite una instalación y configuración sencillas.
 
-  bootstrap:
-    initdb:
-      dataChecksums: true
-      database: nextcloud
-      owner: nextcloud
-      secret:
-        name: cluster-secrets
+      * Primero, agrega el CLI de Cilium.
+        ```sh
+        CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+        CLI_ARCH=amd64
+        if [ "$(uname -m)" = "aarch64" ]; then CLI_ARCH=arm64; fi
+        curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+        sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+        rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+        ```
+      * Luego, instala Cilium
+        ```sh
+        cilium install
+        ```
 
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "1"
-    limits:
-      memory: "1Gi"
-      cpu: "2"
+      * Para validar que Cilium se ha instalado correctamente, puede ejecutar
+        ```sh
+        $ cilium status --wait
+           /¯¯\
+        /¯¯\__/¯¯\    Cilium:         OK
+        \__/¯¯\__/    Operator:       OK
+        /¯¯\__/¯¯\    Hubble:         disabled
+        \__/¯¯\__/    ClusterMesh:    disabled
+           \__/
+        
+        DaemonSet         cilium             Desired: 2, Ready: 2/2, Available: 2/2
+        Deployment        cilium-operator    Desired: 2, Ready: 2/2, Available: 2/2
+        Containers:       cilium-operator    Running: 2
+                          cilium             Running: 2
+        Image versions    cilium             quay.io/cilium/cilium:v1.9.5: 2
+                          cilium-operator    quay.io/cilium/operator-generic:v1.9.5: 2
+        ```
+      
 
-  storage:
-    size: 10Gi
-    pvcTemplate:
-      accessModes:
-        - ReadWriteOnce
-      resources:
-        requests:
-          storage: 1Gi
-      storageClassName: standard
-      volumeMode: Filesystem
+3.  **Instala el Ingress Controller (NGINX)**: Aunque desactivaste el de RKE2, necesitas instalar uno para gestionar el tráfico externo.
 
-  walStorage:
-    size: 5Gi
+      * Agrega el repositorio de Helm de NGINX Ingress Controller.
+        ```sh
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        ```
+      * Instala el controlador.
+        ```sh
+        helm install ingress-nginx ingress-nginx/ingress-nginx \
+        --namespace ingress-nginx \
+        --create-namespace
+        ```
+      * Verifica que el pod de NGINX Ingress se esté ejecutando.
+        ```sh
+        kubectl get pods -n ingress-nginx
+        ```
 
-  managed:
-    services:
-      ## disable the default services
-      disabledDefaultServices: ["r"]
-```
-```
-kubectl apply -f cluster-postgresql.yaml
-```
+## Nodo esclavo
 
-Crearemos las copias de seguridad periódicas
-```yaml
-apiVersion: postgresql.cnpg.io/v1
-kind: ScheduledBackup
-metadata:
-  name: postgresql-node-backup
-  labels:
-    app.kubernetes.io/component: database-backup
-spec:
-  schedule: "0 0 23/12 * * *"
-  backupOwnerReference: none
-  immediate: false
+Para agregar dos nodos (esclavo) más a tu clúster **RKE2** existente, debes generar un token de unión y luego usarlo para unir los nuevos nodos como agentes.
+
+### Paso 1: Obtener el token del servidor
+
+En el nodo donde instalaste RKE2 como servidor (el primer nodo), necesitas obtener el token de unión. Este token se encuentra en el archivo `/var/lib/rancher/rke2/server/node-token`.
+
+Ejecuta el siguiente comando en el nodo servidor para mostrar el token:
+
+```sh
+sudo cat /var/lib/rancher/rke2/server/node-token
 ```
 
-Verificamos el funcionamiento del cluster
-```
-kubectl get pods
-```
-```
-NAME                               READY   STATUS    RESTARTS        AGE
-postgresql-node-1                  1/1     Running   0               3m
-postgresql-node-2                  1/1     Running   0               3m
-postgresql-node-3                  1/1     Running   0               3m
-```
-```
-kubectl get services
-```
-```
-NAME                                 TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)     AGE
-kubernetes                           ClusterIP   10.96.0.1        <none>        443/TCP     1d
-postgresql-node-ro                   ClusterIP   10.97.85.79      <none>        5432/TCP    3m
-postgresql-node-rw                   ClusterIP   10.111.110.188   <none>        5432/TCP    3m
-```
-> [!NOTE]
-> Para mayor informacion del servicio, leer la documentacion [aqui](https://cloudnative-pg.io/documentation/1.26/).
+El token será una larga cadena de caracteres alfanuméricos.
 
-## Redis
-Redis es el serviodr de almacenamiento servira como almacenamiento cache de datos de navegacion dando mayor velocidad. para la generacion del cluster:
+### Paso 2: Configurar y unir los nuevos nodos
 
-### OT Redis Operator
-Es un operador que gestiona la configuración de Redis en modo independiente, clúster, replicación y centinela sobre Kubernetes. Permite crear una configuración de clúster de Redis con las mejores prácticas.
+En cada uno de los dos nuevos nodos, debes crear un archivo de configuración para RKE2. Este archivo le dirá al nodo que se una al clúster como un agente y también le indicará que debe usar Cilium como CNI, al igual que el servidor.
 
-El operador de Redis admite las siguientes estrategias de implementación para Redis:
+1.  **Crea el directorio y el archivo de configuración**:
 
-- **Clúster:** Es simplemente una estrategia de fragmentación de datos . Particiona automáticamente los datos entre múltiples nodos de Redis. Es una función avanzada de Redis que logra almacenamiento distribuido y evita un punto único de fallo.
-- **Replicación:** Utiliza replicación asíncrona, lo que significa que el nodo líder no espera a que los nodos seguidores apliquen los cambios antes de enviar nuevas actualizaciones. En su lugar, los nodos seguidores se ponen al día con el nodo líder tan pronto como pueden.
-- **Sentinel:** Es una herramienta que proporciona conmutación por error y monitorización automáticas para los nodos de Redis.
+    ```sh
+    sudo mkdir -p /etc/rancher/rke2/
+    sudo tee /etc/rancher/rke2/config.yaml > /dev/null <<EOF
+    server: https://<DIRECCIÓN_IP_DEL_SERVIDOR>:9345
+    token: <TU_TOKEN_OBTENIDO_ARRIBA>
+    cni: "none"
+    disable-kube-proxy: true
+    EOF
+    ```
 
-Para el caso actual, usaremos el metodo de Replicacion,El siguiente diagrama proporciona una vista simplista de la arquitectura compartida
+      * **`<DIRECCIÓN_IP_DEL_SERVIDOR>`**: Reemplaza esto con la dirección IP del nodo donde instalaste RKE2 como servidor.
+      * **`<TU_TOKEN_OBTENIDO_ARRIBA>`**: Reemplaza esto con el token que obtuviste en el paso anterior.
+      * `cni: "none"` y `disable-kube-proxy: true`: Estas líneas son cruciales para asegurar que los nuevos nodos utilicen la misma configuración de red que el servidor principal.
 
-![guia](pictures/replication-redis.png)
+2.  **Instala y ejecuta el agente de RKE2**:
 
-### Instalacion del Cluster Redis
-Añadimos el repositorio en helm y lo instalamos
-```
-helm repo add ot-helm https://ot-container-kit.github.io/helm-charts/
-helm install redis-operator ot-helm/redis-operator --namespace ot-operators --create-namespace 
-```
-Comprobamos la instalacion
-```
-kubectl get pods -n ot-operators
-```
-```
-NAME                             READY   STATUS    RESTARTS      AGE
-redis-operator-bb784b6df-4pfxt   1/1     Running   0             4m
-```
-Usamos el manifiesto YAML para la creacion del cluster
-```yaml
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisSentinel
-metadata:
-  name: redis-sentinel
-spec:
-  clusterSize: 3
-  podSecurityContext:
-    runAsUser: 1000
-    fsGroup: 1000
-  redisSentinelConfig:
-    redisReplicationName: redis-replication
-    redisReplicationPassword:
-      secretKeyRef:
-        name: password-nextcloud
-        key: redis_password
-  kubernetesConfig:
-    image: quay.io/opstree/redis-sentinel:v7.0.15
-    imagePullPolicy: IfNotPresent
-    redisSecret:
-      name: password-nextcloud
-      key: redis_password
-    resources:
-      requests:
-        cpu: "1"
-        memory: "2Gi"
-      limits:
-        cpu: "2"
-        memory: "4Gi"
----
-apiVersion: redis.redis.opstreelabs.in/v1beta2
-kind: RedisReplication
-metadata:
-  name: redis-replication
-spec:
-  clusterSize: 3
-  kubernetesConfig:
-    image: quay.io/opstree/redis:v7.0.15
-    imagePullPolicy: IfNotPresent
-    redisSecret:
-      name: password-nextcloud
-      key: redis_password
-  storage:
-    volumeClaimTemplate:
-      spec:
-        storageClassName: nfs-client
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 10Gi
-  redisExporter:
-    enabled: false
-    image: quay.io/opstree/redis-exporter:v1.44.0
-  podSecurityContext:
-    runAsUser: 1000
-    fsGroup: 1000
-```
-```
-kubectl apply -f cluster-redis.yaml
+      * En cada uno de los nuevos nodos, descarga y ejecuta el script de instalación, pero esta vez, se instalará como agente (`rke2-agent`).
+
+    <!-- end list -->
+
+    ```sh
+    curl -sfL https://get.rke2.io | sudo INSTALL_RKE2_TYPE="agent" sh -
+    ```
+
+      * Una vez que el script finalice, habilita y comienza el servicio del agente.
+
+    <!-- end list -->
+
+    ```sh
+    sudo systemctl enable --now rke2-agent.service
+    ```
+
+    Después de un minuto o dos, los nodos se conectarán al servidor, Cilium se desplegará en ellos y se unirán al clúster.
+
+### Paso 3: Verificar la unión de los nodos
+
+Vuelve al nodo servidor y ejecuta el siguiente comando para ver el estado de los nodos del clúster:
+
+```sh
+kubectl get nodes
 ```
 
-Verificamos el funcionamiento del cluster
-```
-kubectl get pods
-```
-```
-NAME                        READY   STATUS    RESTARTS   AGE
-redis-replication-0         1/1     Running   0             15m
-redis-replication-1         1/1     Running   0             15m
-redis-replication-2         1/1     Running   0             15m
-redis-sentinel-sentinel-0   1/1     Running   0             14m
-redis-sentinel-sentinel-1   1/1     Running   0             14m
-redis-sentinel-sentinel-2   1/1     Running   0             14m
-```
-```
-kubectl get services
-```
-```
-NAME                                 TYPE           CLUSTER-IP       EXTERNAL-IP    PORT(S)        AGE
-kubernetes                           ClusterIP      10.96.0.1        <none>         443/TCP        30m
-redis-replication                    ClusterIP      10.111.8.17      <none>         6379/TCP       16m
-redis-replication-additional         ClusterIP      10.104.207.9     <none>         6379/TCP       16m
-redis-replication-headless           ClusterIP      None             <none>         6379/TCP       16m
-redis-replication-master             ClusterIP      10.98.144.110    <none>         6379/TCP       16m
-redis-replication-replica            ClusterIP      10.99.112.250    <none>         6379/TCP       16m
-redis-sentinel-sentinel              ClusterIP      10.111.52.25     <none>         26379/TCP      16m
-redis-sentinel-sentinel-additional   ClusterIP      10.97.14.223     <none>         26379/TCP      16m
-redis-sentinel-sentinel-headless     ClusterIP      None             <none>         26379/TCP      16m
-```
-> [!NOTE]
-> Para mayor informacion del servicio, leer la documentacion [aqui](https://ot-redis-operator.netlify.app/docs/overview/).
+Deberías ver los tres nodos (el servidor y los dos nuevos agentes) en estado **`Ready`**.
 
-## Nextcloud
-Es la aplicacion principal la cual es un software de código abierto para crear y utilizar servicios de alojamiento de archivos y colaboración en la nube
+## Añadir un Nodo Maestro (HA)
 
-### Componentes PHP - Apache
-En lugar de tener Apache y PHP instalados en el mismo contenedor (como lo harías tradicionalmente con mod_php), en Kubernetes, los desacoplas en pods separados para aprovechar los beneficios de la contenedorización y la orquestación:
+Para añadir un **nodo maestro** adicional a un clúster **RKE2** existente, debes instalar el servicio `rke2-server` en el nuevo nodo, apuntándolo al servidor inicial y utilizando el mismo token. Esto crea un clúster de **alta disponibilidad (HA)**.
 
-- **Apache (Servidor Web / Proxy Inverso):**
-Este pod contendrá la imagen del servidor web Apache HTTP Server. Escuchará las solicitudes HTTP/S entrantes respondiendo con los archivos estáticos de Nextcloud (HTML, CSS, JavaScript, imágenes) y actuando como un proxy inverso para las solicitudes dinámicas de PHP. Apache no la procesa directamente. En su lugar, la reenvía al pod de PHP-FPM.
+### 1\. Preparación del Nuevo Servidor Maestro
 
-- **PHP-FPM (Procesador PHP):**
-Este pod contendrá la imagen de PHP-FPM (FastCGI Process Manager). PHP-FPM no escucha directamente las solicitudes HTTP; en su lugar, espera que el servidor apache le envíe las solicitudes a través del protocolo FastCGI. Cuando Apache le reenvía una solicitud .php, PHP-FPM procesa el código PHP de Nextcloud y devuelve el resultado (generalmente HTML) a Apache.
+De manera similar al primer nodo maestro, necesitas configurar el nuevo nodo maestro para que sepa cómo unirse al clúster y qué componentes deshabilitar.
 
-El siguiente diagrama proporciona una vista simplista de la arquitectura compartida
+#### Obtén la IP y el Token
 
-![guia](pictures/php.png)
+  * **IP del Servidor Inicial:** Necesitas la dirección IP del primer nodo maestro que instalaste. Sustituiremos `<IP_DEL_SERVIDOR_INICIAL>` con esta IP.
+  * **Token del Clúster:** Este es el token que usaste o generaste previamente, que se encuentra en `/var/lib/rancher/rke2/server/node-token` en el servidor inicial. Sustituiremos `<TU_TOKEN_OBTENIDO>` con este valor.
 
-> [!NOTE]
-> Para mayor informacion del servicio, leer la documentacion [aqui](https://docs.nextcloud.com/).
+#### Crea el Archivo de Configuración
 
-### Instalacion de nextcloud
-Usamos el manifiesto YAML para la creacion de los pods de PHP
-```yaml
-#-----------------------------------------------------------
-# PersistentVolumeClaim para Nextcloud
-#-----------------------------------------------------------
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: nextcloud
-  labels:
-    app: nextcloud
-spec:
-  accessModes:
-    - ReadWriteMany
-  volumeMode: Filesystem
-  storageClassName: nfs-client # <--- ¡CAMBIA ESTO A TU STORAGECLASS!
-  resources:
-    requests:
-      storage: 50Gi # <--- ¡CAMBIA ESTO A TU NECESIDAD!
+Crea el directorio y el archivo de configuración en el **nuevo servidor maestro**.
 
----
-#-----------------------------------------------------------
-# Modo de publicacion de Nextcloud
-#-----------------------------------------------------------
-apiVersion: v1
-kind: Service
-metadata:
-  name: nextcloud-fpm
-  labels:
-    app: nextcloud
-    tier: fpm
-spec:
-  selector:
-    app: nextcloud
-    tier: fpm
-  ports:
-    - protocol: TCP
-      port: 9000 #9000
-      targetPort: 9000
-  type: ClusterIP
-
----
-#-----------------------------------------------------------
-# Nextcloud (Aplicación Principal)
-#-----------------------------------------------------------
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nextcloud-fpm
-  labels:
-    app: nextcloud
-    tier: fpm
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: nextcloud
-      tier: fpm
-  template:
-    metadata:
-      labels:
-        app: nextcloud
-        tier: fpm
-    spec:
-      initContainers:
-          #-----------------------------------------------------------
-          # Verificacion de conexion a postgresql
-          #-----------------------------------------------------------
-        - name: wait-for-postgresql
-          image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z postgresql-node-rw 5432; do echo waiting for postgresql; sleep 2; done;']
-          #-----------------------------------------------------------
-          # Verificacion de conexion a redis
-          #-----------------------------------------------------------
-        - name: wait-for-redis
-          image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z redis-replication-master 6379; do echo waiting for redis; sleep 2; done;']
-      containers:
-      - name: nextcloud-fpm
-        image: nextcloud:31.0.6-fpm
-        imagePullPolicy: IfNotPresent
-        #-----------------------------------------------------------
-        # limites de recursos
-        #-----------------------------------------------------------
-        resources:
-          requests:
-            cpu: "500m"
-            memory: "1Gi"
-          limits:
-            cpu: "2"
-            memory: "4Gi"
-        env:
-          - name: NEXTCLOUD_TRUSTED_DOMAINS
-            value: "localhost.test" # <--- ¡CAMBIA ESTO A TU DOMINIO!
-          - name: NO_PROXY
-            value: "localhost,127.0.0.1,nextcloud,10.0.0.0/8,192.168.0.0/16,.svc,.cluster.local"  # <--- ¡CAMBIA ESTO A TUS REDES O EQUIPOS QUE NO ESTAN EN EL PROXY!
-          - name: NEXTCLOUD_OVERWRITEPROTOCOL
-            value: "https"
-          - name: NEXTCLOUD_OVERWRITEHOST
-            value: "localhost.test" # <--- ¡CAMBIA ESTO A TU DOMINIO!
-          - name: NEXTCLOUD_OVERWRITECLIURL
-            value: "https://localhost.test" # <--- ¡CAMBIA ESTO A TU DOMINIO!
-          - name: PHP_OPCACHE_MEMORY_LIMIT 
-            value: "2480M"
-          - name: PHP_MEMORY_LIMIT 
-            value: "1024M"
-          - name: PHP_UPLOAD_LIMIT
-            value: "10G"
-          - name: PHP_MAX_EXECUTION_TIME
-            value: "3600"
-          - name: PHP_MAX_INPUT_TIME
-            value: "3600"
-          #---------------------------------------------------------
-          # Conexion a postgresql
-          #---------------------------------------------------------
-          - name: POSTGRES_HOST
-            value: "postgresql-node-rw"
-          - name: POSTGRES_USER
-            value: nextcloud
-          - name: POSTGRES_PASSWORD
-            valueFrom:
-              secretKeyRef:
-                name: password-nextcloud
-                key: postgresql_password
-          - name: POSTGRES_DB
-            valueFrom:
-              secretKeyRef:
-                name: password-nextcloud
-                key: postgresql_database 
-          #---------------------------------------------------------
-          # Conexion a redis
-          #---------------------------------------------------------
-          - name: REDIS_HOST
-            value: "redis-replication-master"
-          - name: REDIS_PORT
-            value: "6379"
-          - name: REDIS_HOST_PASSWORD 
-            valueFrom:
-              secretKeyRef:
-                name: password-nextcloud
-                key: redis_password
-        ports:
-        - containerPort: 9000
-        volumeMounts:
-          - name: nextcloud
-            mountPath: /var/www/html
-      volumes:
-        - name: nextcloud
-          persistentVolumeClaim:
-            claimName: nextcloud
-```
-```
-kubectl apply -f nextcloud-php.yaml
+```bash
+sudo mkdir -p /etc/rancher/rke2/
+sudo tee /etc/rancher/rke2/config.yaml > /dev/null <<EOF
+server: https://<IP_DEL_SERVIDOR_INICIAL>:9345
+token: <TU_TOKEN_OBTENIDO>
+cni: "none"
+disable:
+- rke2-ingress-nginx
+disable-kube-proxy: true
+EOF
 ```
 
-Usamos el manifiesto YAML para la creacion de los pods de Apache
-```yaml
-#---------------------------------------------------------------------
-# Archivo de configuracion httpd.conf
-#---------------------------------------------------------------------
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: apache-nextcloud-config
-data:
-  httpd.conf: |
-    LoadModule mpm_event_module modules/mod_mpm_event.so
-    LoadModule authz_core_module modules/mod_authz_core.so
-    LoadModule authz_host_module modules/mod_authz_host.so
-    LoadModule dir_module modules/mod_dir.so
-    LoadModule log_config_module modules/mod_log_config.so
-    LoadModule mime_module modules/mod_mime.so
-    LoadModule setenvif_module modules/mod_setenvif.so
-    LoadModule unixd_module modules/mod_unixd.so
-    LoadModule reqtimeout_module modules/mod_reqtimeout.so
-    LoadModule rewrite_module modules/mod_rewrite.so
-    LoadModule headers_module modules/mod_headers.so
-    LoadModule remoteip_module modules/mod_remoteip.so
-    LoadModule proxy_module modules/mod_proxy.so
-    LoadModule proxy_fcgi_module modules/mod_proxy_fcgi.so
+  * **`server: https://<IP_DEL_SERVIDOR_INICIAL>:9345`**: Esta línea es **crucial**. Le dice al nuevo servidor que se una al plano de control existente a través de la IP del primer nodo maestro. El puerto por defecto es `9345`.
+  * **`token: <TU_TOKEN_OBTENIDO>`**: Usa el token que obtuviste del servidor inicial.
+  * Las opciones de `cni: "none"` y `disable-kube-proxy: true` son necesarias para mantener la coherencia con el primer servidor, que usa Cilium y deshabilitó el `kube-proxy`.
 
-    # Server configuration
-    ServerRoot "/usr/local/apache2"
-    Listen 80
+-----
 
-    # User and Group (adjust if needed, but 'daemon' is common for httpd images)
-    User daemon
-    Group daemon
+### 2\. Instalación de RKE2 como nodo Maestro
 
-    # Document Root for Nextcloud
-    DocumentRoot "/var/www/html"
+En el **nuevo servidor maestro**, instala RKE2. A diferencia de los nodos agentes, no se especifica el tipo (`INSTALL_RKE2_TYPE="agent"`), por lo que se instalará como **master** por defecto.
 
-    # Directory settings for Nextcloud
-    <Directory "/var/www/html">
-        Options +FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-
-    # AccessFileName for .htaccess
-    AccessFileName .htaccess
-
-    # ErrorLog and CustomLog
-    ErrorLog logs/error_log
-    LogLevel warn
-    CustomLog logs/access_log common
-
-    # Mime Type settings
-    TypesConfig conf/mime.types
-    AddType application/x-compress .Z
-    AddType application/x-gzip .gz .tgz
-    AddType application/wasm .wasm
-
-    # Add default index file names
-    <IfModule dir_module>
-        DirectoryIndex index.php index.html
-    </IfModule>
-
-    # ProxyPassMatch to FPM
-    # Envía todas las solicitudes PHP a nextcloud-fpm:9000
-    ProxyPassMatch "^/(.*\.php(/.*)?)$" "fcgi://nextcloud-fpm:9000/var/www/html/$1" timeout=3600
-
-    # Nextcloud specific headers and rules
-    <IfModule headers_module>
-        Header always set X-Content-Type-Options "nosniff"
-        Header always set X-XSS-Protection "1; mode=block"
-        Header always set X-Robots-Tag "none"
-        Header always set X-Download-Options "noopen"
-        Header always set X-Permitted-Cross-Domain-Policies "none"
-        Header always set Referrer-Policy "no-referrer"
-        Header always set X-Robots-Tag "noindex,nofollow"
-    </IfModule>
-
-    # Remote IP configuration
-    # If Apache is behind a load balancer, this helps Nextcloud get the correct client IP.
-    <IfModule remoteip_module>
-        RemoteIPTrustedProxy 10.96.0.0/12
-        RemoteIPHeader X-Forwarded-For
-        RemoteIPInternalProxy 127.0.0.1
-    </IfModule>
-
-    # Set Max Request Body Size
-    LimitRequestBody 10737418240
-
-    # Nextcloud's .well-known paths for various services
-    RewriteEngine On
-    RewriteCond %{HTTP:X-Forwarded-Proto} !https
-    # RewriteCond %{HTTPS} off
-    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
-    RewriteRule ^/\.well-known/carddav https://%{HTTP_HOST}/remote.php/dav/ [R=301,L]
-    RewriteRule ^/\.well-known/caldav https://%{HTTP_HOST}/remote.php/dav/ [R=301,L]
-
----
-#-----------------------------------------------------------
-# Modo de publicacion de apache para Nextcloud
-#-----------------------------------------------------------
-apiVersion: v1
-kind: Service
-metadata:
-  name: nextcloud-apache
-  labels:
-    app: nextcloud
-    tier: apache
-spec:
-  selector:
-    app: nextcloud
-    tier: apache
-  ports:
-    - protocol: TCP
-      port: 80
-      targetPort: 80
-  type: LoadBalancer 
-
----
-#-----------------------------------------------------------
-# Apache para Nextcloud (Servidor Web)
-#-----------------------------------------------------------
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: nextcloud-apache
-  labels:
-    app: nextcloud
-    tier: apache
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: nextcloud
-      tier: apache
-  template:
-    metadata:
-      labels:
-        app: nextcloud
-        tier: apache
-    spec:
-      containers:
-      - name: nextcloud-apache
-        image: httpd:2.4
-        resources:
-          requests:
-            cpu: "500m"
-            memory: "1Gi"
-          limits:
-            cpu: "2"
-            memory: "4Gi"
-        ports:
-        - containerPort: 80
-        volumeMounts:
-          - name: nextcloud
-            mountPath: /var/www/html
-          - name: apache-config
-            mountPath: /usr/local/apache2/conf/httpd.conf
-            subPath: httpd.conf
-      volumes:
-        - name: nextcloud
-          persistentVolumeClaim:
-            claimName: nextcloud
-        - name: apache-config
-          configMap:
-            name: apache-nextcloud-config
+```bash
+curl -sfL https://get.rke2.io | sudo sh -
 ```
+
+-----
+
+### 3\. Inicia el Servicio de RKE2
+
+Una vez completada la instalación, inicia y habilita el servicio del servidor RKE2 en el **nuevo nodo**.
+
+```bash
+sudo systemctl enable --now rke2-server.service
+```
+
+-----
+
+### 4\. Verificación
+
+El nuevo nodo se unirá al clúster como un nodo maestro. En el **nodo maestro inicial** o cualquier máquina con el `kubeconfig` configurado, verifica el estado de los nodos:
+
+```bash
+kubectl get nodes
+```
+
+Deberías ver el nuevo nodo con el rol **`control-plane`** o **`master`** (y quizás también `etcd`), y su estado eventualmente cambiará a **`Ready`** a medida que Cilium se despliegue en él y se sincronice con el plano de control. El plano de control de tu clúster RKE2 ahora será de **alta disponibilidad**.
